@@ -1,13 +1,18 @@
 package parser
 
 import (
+	"bytes"
 	"strings"
 	"testing"
 
+	"github.com/google/go-cmp/cmp"
+	"github.com/google/go-cmp/cmp/cmpopts"
 	"github.com/stretchr/testify/assert"
 )
 
-func Test_Parser(t *testing.T) {
+var ignoreCommandBuffer = cmpopts.IgnoreFields(Command{}, "Buffer")
+
+func TestParser(t *testing.T) {
 
 	input := `
 FROM model1
@@ -32,10 +37,10 @@ TEMPLATE template1
 		{Name: "template", Args: "template1"},
 	}
 
-	assert.Equal(t, expectedCommands, commands)
+	assert.True(t, cmp.Equal(expectedCommands, commands, ignoreCommandBuffer))
 }
 
-func Test_Parser_NoFromLine(t *testing.T) {
+func TestParserNoFromLine(t *testing.T) {
 
 	input := `
 PARAMETER param1 value1
@@ -48,7 +53,7 @@ PARAMETER param2 value2
 	assert.ErrorContains(t, err, "no FROM line")
 }
 
-func Test_Parser_MissingValue(t *testing.T) {
+func TestParserMissingValue(t *testing.T) {
 
 	input := `
 FROM foo
@@ -62,7 +67,7 @@ PARAMETER param1
 
 }
 
-func Test_Parser_Messages(t *testing.T) {
+func TestParserMessages(t *testing.T) {
 
 	input := `
 FROM foo
@@ -82,10 +87,10 @@ MESSAGE assistant Hello, I want to parse all the things!
 		{Name: "message", Args: "assistant: Hello, I want to parse all the things!"},
 	}
 
-	assert.Equal(t, expectedCommands, commands)
+	assert.True(t, cmp.Equal(expectedCommands, commands, ignoreCommandBuffer))
 }
 
-func Test_Parser_Messages_BadRole(t *testing.T) {
+func TestParserMessagesBadRole(t *testing.T) {
 
 	input := `
 FROM foo
@@ -95,4 +100,102 @@ MESSAGE badguy I'm a bad guy!
 	reader := strings.NewReader(input)
 	_, err := Parse(reader)
 	assert.ErrorContains(t, err, "role must be one of \"system\", \"user\", or \"assistant\"")
+}
+
+func TestParserMultiline(t *testing.T) {
+	var cases = []struct {
+		input    string
+		expected []Command
+	}{
+		{
+			`FROM foo
+TEMPLATE """
+{{ .System }}
+
+{{ .Prompt }}
+"""
+
+SYSTEM """
+This is a multiline system message.
+"""
+`,
+			[]Command{
+				{Name: "model", Args: "foo"},
+				{Name: "template", Args: "{{ .System }}\n\n{{ .Prompt }}\n"},
+				{Name: "system", Args: "This is a multiline system message.\n"},
+			},
+		},
+		{
+			`FROM foo
+TEMPLATE """{{ .System }} {{ .Prompt }}"""`,
+			[]Command{
+				{Name: "model", Args: "foo"},
+				{Name: "template", Args: "{{ .System }} {{ .Prompt }}"},
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run("", func(t *testing.T) {
+			reader := strings.NewReader(tc.input)
+			commands, err := Parse(reader)
+			assert.Nil(t, err)
+
+			assert.True(t, cmp.Equal(tc.expected, commands, ignoreCommandBuffer))
+		})
+	}
+}
+
+func TestParserParameters(t *testing.T) {
+
+	var cases = []string{
+		"numa true",
+		"num_ctx 1",
+		"num_batch 1",
+		"num_gqa 1",
+		"num_gpu 1",
+		"main_gpu 1",
+		"low_vram true",
+		"f16_kv true",
+		"logits_all true",
+		"vocab_only true",
+		"use_mmap true",
+		"use_mlock true",
+		"num_thread 1",
+		"num_keep 1",
+		"seed 1",
+		"num_predict 1",
+		"top_k 1",
+		"top_p 1.0",
+		"tfs_z 1.0",
+		"typical_p 1.0",
+		"repeat_last_n 1",
+		"temperature 1.0",
+		"repeat_penalty 1.0",
+		"presence_penalty 1.0",
+		"frequency_penalty 1.0",
+		"mirostat 1",
+		"mirostat_tau 1.0",
+		"mirostat_eta 1.0",
+		"penalize_newline true",
+		"stop foo",
+	}
+
+	for _, c := range cases {
+		t.Run(c, func(t *testing.T) {
+			var b bytes.Buffer
+			b.WriteString("FROM foo\nPARAMETER ")
+			b.WriteString(c)
+			_, err := Parse(&b)
+			assert.Nil(t, err)
+		})
+	}
+}
+
+func TestParserOnlyFrom(t *testing.T) {
+	commands, err := Parse(strings.NewReader("FROM foo"))
+	assert.Nil(t, err)
+
+	expected := []Command{{Name: "model", Args: "foo"}}
+	assert.True(t, cmp.Equal(expected, commands, ignoreCommandBuffer))
 }
