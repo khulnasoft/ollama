@@ -109,7 +109,7 @@ You are a multiline Parser. Always Parse things.
 			`,
 			[]Command{
 				{Name: "model", Args: "foo"},
-				{Name: "message", Args: "system: You are a multiline Parser. Always Parse things.\n"},
+				{Name: "message", Args: "system: \nYou are a multiline Parser. Always Parse things.\n"},
 			},
 			nil,
 		},
@@ -163,7 +163,7 @@ multiline template.
 			`,
 			[]Command{
 				{Name: "model", Args: "foo"},
-				{Name: "template", Args: "This is a\nmultiline template.\n"},
+				{Name: "template", Args: "\nThis is a\nmultiline template.\n"},
 			},
 			nil,
 		},
@@ -176,7 +176,7 @@ multiline template."""
 			`,
 			[]Command{
 				{Name: "model", Args: "foo"},
-				{Name: "template", Args: "This is a\nmultiline template."},
+				{Name: "template", Args: "\nThis is a\nmultiline template."},
 			},
 			nil,
 		},
@@ -274,4 +274,29 @@ func TestParserOnlyFrom(t *testing.T) {
 
 	expected := []Command{{Name: "model", Args: "foo"}}
 	assert.True(t, cmp.Equal(expected, commands, ignoreCommandBuffer))
+}
+
+func TestParserComments(t *testing.T) {
+	var cases = []struct {
+		input    string
+		expected []Command
+	}{
+		{
+			`
+# comment
+FROM foo
+	`,
+			[]Command{
+				{Name: "model", Args: "foo"},
+			},
+		},
+	}
+
+	for _, c := range cases {
+		t.Run("", func(t *testing.T) {
+			commands, err := Parse(strings.NewReader(c.input))
+			assert.Nil(t, err)
+			assert.True(t, cmp.Equal(c.expected, commands, ignoreCommandBuffer))
+		})
+	}
 }

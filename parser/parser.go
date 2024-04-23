@@ -37,13 +37,13 @@ func Parse(r io.Reader) ([]Command, error) {
 		}
 
 		// trim leading whitespace
-		if (space(r) || newline(r)) && b.Len() == 0 {
+		if (space(r) || newline(r)) && b.Len() == 0 && s == stateName {
 			continue
 		}
 
 		switch s {
-		case stateName, stateParameter:
-			if alpha(r) || number(r) || (r == '_' && s == stateParameter) {
+		case stateName:
+			if alpha(r) || number(r) {
 				if _, err := b.WriteRune(r); err != nil {
 					return nil, err
 				}
@@ -63,6 +63,22 @@ func Parse(r io.Reader) ([]Command, error) {
 				default:
 					s = stateArgs
 				}
+			} else if newline(r) {
+				return nil, fmt.Errorf("missing value for [%s]", b.String())
+			} else if r == '#' {
+				s = stateComment
+			} else {
+				return nil, fmt.Errorf("unexpected rune %q for state %d", r, s)
+			}
+		case stateParameter:
+			if alpha(r) || number(r) || (r == '_' && s == stateParameter) {
+				if _, err := b.WriteRune(r); err != nil {
+					return nil, err
+				}
+			} else if space(r) {
+				cmd.Name = strings.ToLower(b.String())
+				b.Reset()
+				s = stateArgs
 			} else if newline(r) {
 				return nil, fmt.Errorf("missing value for [%s]", b.String())
 			} else {
@@ -119,6 +135,12 @@ func Parse(r io.Reader) ([]Command, error) {
 					return nil, err
 				}
 			}
+		case stateComment:
+			if newline(r) {
+				b.Reset()
+				cmd = Command{}
+				s = stateName
+			}
 		}
 	}
 
@@ -150,6 +172,7 @@ const (
 	stateMultiline
 	stateParameter
 	stateMessage
+	stateComment
 )
 
 func alpha(r rune) bool {
