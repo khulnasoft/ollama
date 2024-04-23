@@ -73,7 +73,7 @@ func Parse(r io.Reader) ([]Command, error) {
 				quotes++
 				s = stateMultiline
 			} else if newline(r) {
-				cmd.Args = b.String()
+				cmd.Args += b.String()
 				b.Reset()
 
 				cmds = append(cmds, cmd)
@@ -87,18 +87,15 @@ func Parse(r io.Reader) ([]Command, error) {
 		case stateMultiline:
 			if r == '"' && b.Len() == 0 {
 				quotes++
-				continue
 			} else if r == '"' {
 				if quotes--; quotes == 0 {
-					cmd.Args = b.String()
+					cmd.Args += b.String()
 					b.Reset()
 
 					cmds = append(cmds, cmd)
 					cmd = Command{}
 					s = stateName
 				}
-
-				continue
 			} else {
 				if _, err := b.WriteRune(r); err != nil {
 					return nil, err
@@ -108,14 +105,19 @@ func Parse(r io.Reader) ([]Command, error) {
 			if space(r) && !isValidRole(b.String()) {
 				return nil, errors.New("role must be one of \"system\", \"user\", or \"assistant\"")
 			} else if space(r) {
-				if _, err := b.WriteRune(':'); err != nil {
+				if _, err := b.WriteString(": "); err != nil {
 					return nil, err
 				}
-				s = stateArgs
-			}
 
-			if _, err := b.WriteRune(r); err != nil {
-				return nil, err
+				cmd.Args += b.String()
+				b.Reset()
+				s = stateArgs
+			} else if newline(r) {
+				return nil, fmt.Errorf("missing value for [%s]", b.String())
+			} else {
+				if _, err := b.WriteRune(r); err != nil {
+					return nil, err
+				}
 			}
 		}
 	}
@@ -126,6 +128,8 @@ func Parse(r io.Reader) ([]Command, error) {
 		case stateArgs:
 			cmd.Args = b.String()
 			cmds = append(cmds, cmd)
+		case stateMultiline:
+			return nil, errors.New("unterminated multiline string")
 		default:
 			return nil, fmt.Errorf("missing value for [%s]", b.String())
 		}
