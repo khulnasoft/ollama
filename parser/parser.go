@@ -15,12 +15,19 @@ type Command struct {
 	bytes.Buffer
 }
 
+const (
+	stateName = iota
+	stateArgs
+	stateMultiline
+	stateParameter
+	stateMessage
+	stateComment
+)
+
 func Parse(r io.Reader) ([]Command, error) {
 	var cmds []Command
 	var cmd Command
 	var b bytes.Buffer
-
-	var quotes int
 
 	s := stateName
 	br := bufio.NewReader(r)
@@ -36,91 +43,87 @@ func Parse(r io.Reader) ([]Command, error) {
 			return nil, err
 		}
 
-		// trim leading whitespace
-		if (space(r) || newline(r)) && b.Len() == 0 && s == stateName {
-			continue
-		}
-
 		switch s {
 		case stateName:
-			if alpha(r) || number(r) {
+			switch {
+			case alpha(r), number(r):
 				if _, err := b.WriteRune(r); err != nil {
 					return nil, err
 				}
-			} else if space(r) {
-				cmd.Name = strings.ToLower(b.String())
-				b.Reset()
-
-				if cmd.Name == "from" {
-					cmd.Name = "model"
-				}
-
-				switch cmd.Name {
-				case "parameter":
-					s = stateParameter
-				case "message":
-					s = stateMessage
-				default:
-					s = stateArgs
-				}
-			} else if newline(r) {
-				return nil, fmt.Errorf("missing value for [%s]", b.String())
-			} else if r == '#' {
+			case r == '#':
 				s = stateComment
-			} else {
+			case space(r):
+				if b.Len() > 0 {
+					cmd.Name = strings.ToLower(b.String())
+					b.Reset()
+
+					if cmd.Name == "from" {
+						cmd.Name = "model"
+					}
+
+					switch cmd.Name {
+					case "parameter":
+						s = stateParameter
+					case "message":
+						s = stateMessage
+					default:
+						s = stateArgs
+					}
+				}
+			case newline(r):
+				if b.Len() > 0 {
+					return nil, fmt.Errorf("missing value for [%s]", b.String())
+				}
+			default:
 				return nil, fmt.Errorf("unexpected rune %q for state %d", r, s)
 			}
 		case stateParameter:
-			if alpha(r) || number(r) || (r == '_' && s == stateParameter) {
+			switch {
+			case alpha(r), number(r), r == '_':
 				if _, err := b.WriteRune(r); err != nil {
 					return nil, err
 				}
-			} else if space(r) {
+			case space(r):
 				cmd.Name = strings.ToLower(b.String())
 				b.Reset()
 				s = stateArgs
-			} else if newline(r) {
+			case newline(r):
 				return nil, fmt.Errorf("missing value for [%s]", b.String())
-			} else {
+			default:
 				return nil, fmt.Errorf("unexpected rune %q for state %d", r, s)
 			}
 		case stateArgs:
-			if r == '"' && b.Len() == 0 {
-				quotes++
-				s = stateMultiline
-			} else if newline(r) {
+			switch {
+			// TODO
+			// case quote(r):
+			case newline(r):
 				cmd.Args += b.String()
 				b.Reset()
 
 				cmds = append(cmds, cmd)
 				cmd = Command{}
 				s = stateName
-			} else {
+			default:
 				if _, err := b.WriteRune(r); err != nil {
 					return nil, err
 				}
 			}
 		case stateMultiline:
-			if r == '"' && b.Len() == 0 {
-				quotes++
-			} else if r == '"' {
-				if quotes--; quotes == 0 {
-					cmd.Args += b.String()
-					b.Reset()
-
-					cmds = append(cmds, cmd)
-					cmd = Command{}
-					s = stateName
-				}
-			} else {
+			switch {
+			// TODO
+			// case quote(r):
+			default:
 				if _, err := b.WriteRune(r); err != nil {
 					return nil, err
 				}
 			}
 		case stateMessage:
-			if space(r) && !isValidRole(b.String()) {
-				return nil, errors.New("role must be one of \"system\", \"user\", or \"assistant\"")
-			} else if space(r) {
+			switch {
+			case space(r):
+				if !isValidRole(b.String()) {
+					return nil, errors.New("role must be one of \"system\", \"user\", or \"assistant\"")
+				}
+
 				if _, err := b.WriteString(": "); err != nil {
 					return nil, err
 				}
@@ -128,9 +131,9 @@ func Parse(r io.Reader) ([]Command, error) {
 				cmd.Args += b.String()
 				b.Reset()
 				s = stateArgs
-			} else if newline(r) {
+			case newline(r):
 				return nil, fmt.Errorf("missing value for [%s]", b.String())
-			} else {
+			default:
 				if _, err := b.WriteRune(r); err != nil {
 					return nil, err
 				}
@@ -166,15 +169,6 @@ func Parse(r io.Reader) ([]Command, error) {
 	return nil, errors.New("no FROM line")
 }
 
-const (
-	stateName = iota
-	stateArgs
-	stateMultiline
-	stateParameter
-	stateMessage
-	stateComment
-)
-
 func alpha(r rune) bool {
 	return r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z'
 }
@@ -189,6 +183,10 @@ func space(r rune) bool {
 
 func newline(r rune) bool {
 	return r == '\r' || r == '\n'
+}
+
+func quote(r rune) bool {
+	return r == '"' || r == '\''
 }
 
 func isValidRole(role string) bool {
