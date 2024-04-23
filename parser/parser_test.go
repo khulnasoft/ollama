@@ -211,6 +211,19 @@ TEMPLATE """This is a multiline template.""
 			nil,
 			errors.New("unterminated multiline string"),
 		},
+		{
+			`
+FROM foo
+TEMPLATE """
+This is a multiline template with "quotes".
+"""
+`,
+			[]Command{
+				{Name: "model", Args: "foo"},
+				{Name: "template", Args: "\nThis is a multiline template with \"quotes\".\n"},
+			},
+			nil,
+		},
 	}
 
 	for _, c := range cases {
