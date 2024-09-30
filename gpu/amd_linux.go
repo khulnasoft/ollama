@@ -5,13 +5,17 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
+	"sort"
 	"strconv"
 	"strings"
 
+	"github.com/ollama/ollama/envconfig"
 	"github.com/ollama/ollama/format"
 )
 
@@ -24,36 +28,43 @@ const (
 
 	// Prefix with the node dir
 	GPUTotalMemoryFileGlob = "mem_banks/*/properties" // size_in_bytes line
-	GPUUsedMemoryFileGlob  = "mem_banks/*/used_memory"
-	RocmStandardLocation   = "/opt/rocm/lib"
+
+	// Direct Rendering Manager sysfs location
+	DRMDeviceDirGlob   = "/sys/class/drm/card*/device"
+	DRMTotalMemoryFile = "mem_info_vram_total"
+	DRMUsedMemoryFile  = "mem_info_vram_used"
+
+	// In hex; properties file is in decimal
+	DRMUniqueIDFile = "unique_id"
+	DRMVendorFile   = "vendor"
+	DRMDeviceFile   = "device"
 )
 
 var (
 	// Used to validate if the given ROCm lib is usable
-	ROCmLibGlobs = []string{"libhipblas.so.2*", "rocblas"} // TODO - probably include more coverage of files here...
+	ROCmLibGlobs          = []string{"libhipblas.so.2*", "rocblas"} // TODO - probably include more coverage of files here...
+	RocmStandardLocations = []string{"/opt/rocm/lib", "/usr/lib64"}
 )
 
 // Gather GPU information from the amdgpu driver if any supported GPUs are detected
-func AMDGetGPUInfo() []GpuInfo {
-	resp := []GpuInfo{}
+func AMDGetGPUInfo() []RocmGPUInfo {
+	resp := []RocmGPUInfo{}
 	if !AMDDetected() {
 		return resp
 	}
 
 	// Opportunistic logging of driver version to aid in troubleshooting
-	ver, err := AMDDriverVersion()
-	if err == nil {
-		slog.Info("AMD Driver: " + ver)
-	} else {
+	driverMajor, driverMinor, err := AMDDriverVersion()
+	if err != nil {
 		// TODO - if we see users crash and burn with the upstreamed kernel this can be adjusted to hard-fail rocm support and fallback to CPU
 		slog.Warn("ollama recommends running the https://www.amd.com/en/support/linux-drivers", "error", err)
 	}
 
 	// Determine if the user has already pre-selected which GPUs to look at, then ignore the others
 	var visibleDevices []string
-	hipVD := os.Getenv("HIP_VISIBLE_DEVICES")   // zero based index only
-	rocrVD := os.Getenv("ROCR_VISIBLE_DEVICES") // zero based index or UUID, but consumer cards seem to not support UUID
-	gpuDO := os.Getenv("GPU_DEVICE_ORDINAL")    // zero based index
+	hipVD := envconfig.HipVisibleDevices()   // zero based index only
+	rocrVD := envconfig.RocrVisibleDevices() // zero based index or UUID, but consumer cards seem to not support UUID
+	gpuDO := envconfig.GpuDeviceOrdinal()    // zero based index
 	switch {
 	// TODO is this priorty order right?
 	case hipVD != "":
@@ -66,13 +77,27 @@ func AMDGetGPUInfo() []GpuInfo {
 		visibleDevices = strings.Split(gpuDO, ",")
 	}
 
-	gfxOverride := os.Getenv("HSA_OVERRIDE_GFX_VERSION")
+	gfxOverride := envconfig.HsaOverrideGfxVersion()
 	var supported []string
 	libDir := ""
 
 	// The amdgpu driver always exposes the host CPU(s) first, but we have to skip them and subtract
 	// from the other IDs to get alignment with the HIP libraries expectations (zero is the first GPU, not the CPU)
 	matches, _ := filepath.Glob(GPUPropertiesFileGlob)
+	sort.Slice(matches, func(i, j int) bool {
+		// /sys/class/kfd/kfd/topology/nodes/<number>/properties
+		a, err := strconv.ParseInt(filepath.Base(filepath.Dir(matches[i])), 10, 64)
+		if err != nil {
+			slog.Debug("parse err", "error", err, "match", matches[i])
+			return false
+		}
+		b, err := strconv.ParseInt(filepath.Base(filepath.Dir(matches[j])), 10, 64)
+		if err != nil {
+			slog.Debug("parse err", "error", err, "match", matches[i])
+			return false
+		}
+		return a < b
+	})
 	cpuCount := 0
 	for _, match := range matches {
 		slog.Debug("evaluating amdgpu node " + match)
@@ -91,6 +116,7 @@ func AMDGetGPUInfo() []GpuInfo {
 		scanner := bufio.NewScanner(fp)
 		isCPU := false
 		var major, minor, patch uint64
+		var vendor, device, uniqueID uint64
 		for scanner.Scan() {
 			line := strings.TrimSpace(scanner.Text())
 			// Note: we could also use "cpu_cores_count X" where X is greater than zero to detect CPUs
@@ -118,12 +144,45 @@ func AMDGetGPUInfo() []GpuInfo {
 					slog.Debug("malformed int " + line)
 					continue
 				}
+			} else if strings.HasPrefix(line, "vendor_id") {
+				ver := strings.Fields(line)
+				if len(ver) != 2 {
+					slog.Debug("malformed", "vendor_id", line)
+					continue
+				}
+				vendor, err = strconv.ParseUint(ver[1], 10, 64)
+				if err != nil {
+					slog.Debug("malformed", "vendor_id", line, "error", err)
+				}
+			} else if strings.HasPrefix(line, "device_id") {
+				ver := strings.Fields(line)
+				if len(ver) != 2 {
+					slog.Debug("malformed", "device_id", line)
+					continue
+				}
+				device, err = strconv.ParseUint(ver[1], 10, 64)
+				if err != nil {
+					slog.Debug("malformed", "device_id", line, "error", err)
+				}
+			} else if strings.HasPrefix(line, "unique_id") {
+				ver := strings.Fields(line)
+				if len(ver) != 2 {
+					slog.Debug("malformed", "unique_id", line)
+					continue
+				}
+				uniqueID, err = strconv.ParseUint(ver[1], 10, 64)
+				if err != nil {
+					slog.Debug("malformed", "unique_id", line, "error", err)
+				}
 			}
-
 			// TODO - any other properties we want to extract and record?
 			// vendor_id + device_id -> pci lookup for "Name"
 			// Other metrics that may help us understand relative performance between multiple GPUs
 		}
+
+		// Note: while ./mem_banks/*/used_memory exists, it doesn't appear to take other VRAM consumers
+		// into consideration, so we instead map the device over to the DRM driver sysfs nodes which
+		// do reliably report VRAM usage.
 
 		if isCPU {
 			cpuCount++
@@ -136,98 +195,109 @@ func AMDGetGPUInfo() []GpuInfo {
 		// Shouldn't happen, but just in case...
 		if gpuID < 0 {
 			slog.Error("unexpected amdgpu sysfs data resulted in negative GPU ID, please set OLLAMA_DEBUG=1 and report an issue")
-			return []GpuInfo{}
+			return nil
 		}
 
 		if int(major) < RocmComputeMin {
-			slog.Warn(fmt.Sprintf("amdgpu too old gfx%d%d%x", major, minor, patch), "gpu", gpuID)
+			slog.Warn(fmt.Sprintf("amdgpu too old gfx%d%x%x", major, minor, patch), "gpu", gpuID)
 			continue
 		}
 
 		// Look up the memory for the current node
 		totalMemory := uint64(0)
 		usedMemory := uint64(0)
-		propGlob := filepath.Join(AMDNodesSysfsDir, strconv.Itoa(nodeID), GPUTotalMemoryFileGlob)
-		propFiles, err := filepath.Glob(propGlob)
-		if err != nil {
-			slog.Warn("error looking up total GPU memory", "glob", propGlob, "error", err)
+		var usedFile string
+		mapping := []struct {
+			id       uint64
+			filename string
+		}{
+			{vendor, DRMVendorFile},
+			{device, DRMDeviceFile},
+			{uniqueID, DRMUniqueIDFile}, // Not all devices will report this
 		}
-		// 1 or more memory banks - sum the values of all of them
-		for _, propFile := range propFiles {
-			fp, err := os.Open(propFile)
-			if err != nil {
-				slog.Warn("failed to open sysfs node", "file", propFile, "erroir", err)
-				continue
-			}
-			defer fp.Close()
-			scanner := bufio.NewScanner(fp)
-			for scanner.Scan() {
-				line := strings.TrimSpace(scanner.Text())
-				if strings.HasPrefix(line, "size_in_bytes") {
-					ver := strings.Fields(line)
-					if len(ver) != 2 {
-						slog.Warn("malformed " + line)
-						continue
-					}
-					bankSizeInBytes, err := strconv.ParseUint(ver[1], 10, 64)
-					if err != nil {
-						slog.Warn("malformed int " + line)
-						continue
-					}
-					totalMemory += bankSizeInBytes
+		slog.Debug("mapping amdgpu to drm sysfs nodes", "amdgpu", match, "vendor", vendor, "device", device, "unique_id", uniqueID)
+		// Map over to DRM location to find the total/free memory
+		drmMatches, _ := filepath.Glob(DRMDeviceDirGlob)
+		for _, devDir := range drmMatches {
+			matched := true
+			for _, m := range mapping {
+				if m.id == 0 {
+					// Null ID means it didn't populate, so we can't use it to match
+					continue
+				}
+				filename := filepath.Join(devDir, m.filename)
+				buf, err := os.ReadFile(filename)
+				if err != nil {
+					slog.Debug("failed to read sysfs node", "file", filename, "error", err)
+					matched = false
+					break
+				}
+				// values here are in hex, strip off the lead 0x and parse so we can compare the numeric (decimal) values in amdgpu
+				cmp, err := strconv.ParseUint(strings.TrimPrefix(strings.TrimSpace(string(buf)), "0x"), 16, 64)
+				if err != nil {
+					slog.Debug("failed to parse sysfs node", "file", filename, "error", err)
+					matched = false
+					break
+				}
+				if cmp != m.id {
+					matched = false
+					break
 				}
 			}
-		}
-		if totalMemory == 0 {
-			slog.Warn("amdgpu reports zero total memory", "gpu", gpuID)
-			continue
-		}
-		usedGlob := filepath.Join(AMDNodesSysfsDir, strconv.Itoa(nodeID), GPUUsedMemoryFileGlob)
-		usedFiles, err := filepath.Glob(usedGlob)
-		if err != nil {
-			slog.Warn("error looking up used GPU memory", "glob", usedGlob, "error", err)
-			continue
-		}
-		for _, usedFile := range usedFiles {
-			fp, err := os.Open(usedFile)
-			if err != nil {
-				slog.Warn("failed to open sysfs node", "file", usedFile, "error", err)
+			if !matched {
 				continue
 			}
-			defer fp.Close()
-			data, err := io.ReadAll(fp)
+
+			// Found the matching DRM directory
+			slog.Debug("matched", "amdgpu", match, "drm", devDir)
+			totalFile := filepath.Join(devDir, DRMTotalMemoryFile)
+			buf, err := os.ReadFile(totalFile)
 			if err != nil {
-				slog.Warn("failed to read sysfs node", "file", usedFile, "error", err)
-				continue
+				slog.Debug("failed to read sysfs node", "file", totalFile, "error", err)
+				break
 			}
-			used, err := strconv.ParseUint(strings.TrimSpace(string(data)), 10, 64)
+			totalMemory, err = strconv.ParseUint(strings.TrimSpace(string(buf)), 10, 64)
 			if err != nil {
-				slog.Warn("malformed used memory", "data", string(data), "error", err)
-				continue
+				slog.Debug("failed to parse sysfs node", "file", totalFile, "error", err)
+				break
 			}
-			usedMemory += used
+
+			usedFile = filepath.Join(devDir, DRMUsedMemoryFile)
+			usedMemory, err = getFreeMemory(usedFile)
+			if err != nil {
+				slog.Debug("failed to update used memory", "error", err)
+			}
+			break
 		}
 
 		// iGPU detection, remove this check once we can support an iGPU variant of the rocm library
 		if totalMemory < IGPUMemLimit {
-			slog.Info("amdgpu appears to be an iGPU, skipping", "gpu", gpuID, "total", format.HumanBytes2(totalMemory))
+			slog.Info("unsupported Radeon iGPU detected skipping", "id", gpuID, "total", format.HumanBytes2(totalMemory))
 			continue
 		}
+		var name string
+		// TODO - PCI ID lookup
+		if vendor > 0 && device > 0 {
+			name = fmt.Sprintf("%04x:%04x", vendor, device)
+		}
 
-		slog.Info("amdgpu memory", "gpu", gpuID, "total", format.HumanBytes2(totalMemory))
-		slog.Info("amdgpu memory", "gpu", gpuID, "available", format.HumanBytes2(totalMemory-usedMemory))
-		gpuInfo := GpuInfo{
-			Library: "rocm",
-			memInfo: memInfo{
-				TotalMemory: totalMemory,
-				FreeMemory:  (totalMemory - usedMemory),
+		slog.Debug("amdgpu memory", "gpu", gpuID, "total", format.HumanBytes2(totalMemory))
+		slog.Debug("amdgpu memory", "gpu", gpuID, "available", format.HumanBytes2(totalMemory-usedMemory))
+		gpuInfo := RocmGPUInfo{
+			GpuInfo: GpuInfo{
+				Library: "rocm",
+				memInfo: memInfo{
+					TotalMemory: totalMemory,
+					FreeMemory:  (totalMemory - usedMemory),
+				},
+				ID:            strconv.Itoa(gpuID),
+				Name:          name,
+				Compute:       fmt.Sprintf("gfx%d%x%x", major, minor, patch),
+				MinimumMemory: rocmMinimumMemory,
+				DriverMajor:   driverMajor,
+				DriverMinor:   driverMinor,
 			},
-			ID: fmt.Sprintf("%d", gpuID),
-			// Name: not exposed in sysfs directly, would require pci device id lookup
-			Major:         int(major),
-			Minor:         int(minor),
-			Patch:         int(patch),
-			MinimumMemory: rocmMinimumMemory,
+			usedFilepath: usedFile,
 		}
 
 		// If the user wants to filter to a subset of devices, filter out if we aren't a match
@@ -251,7 +321,7 @@ func AMDGetGPUInfo() []GpuInfo {
 			libDir, err = AMDValidateLibDir()
 			if err != nil {
 				slog.Warn("unable to verify rocm library, will use cpu", "error", err)
-				return []GpuInfo{}
+				return nil
 			}
 		}
 		gpuInfo.DependencyPath = libDir
@@ -262,11 +332,11 @@ func AMDGetGPUInfo() []GpuInfo {
 				supported, err = GetSupportedGFX(libDir)
 				if err != nil {
 					slog.Warn("failed to lookup supported GFX types, falling back to CPU mode", "error", err)
-					return []GpuInfo{}
+					return nil
 				}
 				slog.Debug("rocm supported GPUs", "types", supported)
 			}
-			gfx := fmt.Sprintf("gfx%d%d%x", gpuInfo.Major, gpuInfo.Minor, gpuInfo.Patch)
+			gfx := gpuInfo.Compute
 			if !slices.Contains[[]string, string](supported, gfx) {
 				slog.Warn("amdgpu is not supported", "gpu", gpuInfo.ID, "gpu_type", gfx, "library", libDir, "supported_types", supported)
 				// TODO - consider discrete markdown just for ROCM troubleshooting?
@@ -276,7 +346,12 @@ func AMDGetGPUInfo() []GpuInfo {
 				slog.Info("amdgpu is supported", "gpu", gpuInfo.ID, "gpu_type", gfx)
 			}
 		} else {
-			slog.Debug("skipping rocm gfx compatibility check with HSA_OVERRIDE_GFX_VERSION=" + gfxOverride)
+			slog.Info("skipping rocm gfx compatibility check", "HSA_OVERRIDE_GFX_VERSION", gfxOverride)
+		}
+
+		// Check for env var workarounds
+		if name == "1002:687f" { // Vega RX 56
+			gpuInfo.EnvWorkarounds = append(gpuInfo.EnvWorkarounds, [2]string{"HSA_ENABLE_SDMA", "0"})
 		}
 
 		// The GPU has passed all the verification steps and is supported
@@ -284,6 +359,10 @@ func AMDGetGPUInfo() []GpuInfo {
 	}
 	if len(resp) == 0 {
 		slog.Info("no compatible amdgpu devices detected")
+	}
+	if err := verifyKFDDriverAccess(); err != nil {
+		slog.Error("amdgpu devices detected but permission problems block access", "error", err)
+		return nil
 	}
 	return resp
 }
@@ -319,22 +398,81 @@ func AMDValidateLibDir() (string, error) {
 
 	// If we still haven't found a usable rocm, the user will have to install it on their own
 	slog.Warn("amdgpu detected, but no compatible rocm library found.  Either install rocm v6, or follow manual install instructions at https://github.com/ollama/ollama/blob/main/docs/linux.md#manual-install")
-	return "", fmt.Errorf("no suitable rocm found, falling back to CPU")
+	return "", errors.New("no suitable rocm found, falling back to CPU")
 }
 
-func AMDDriverVersion() (string, error) {
-	_, err := os.Stat(DriverVersionFile)
+func AMDDriverVersion() (driverMajor, driverMinor int, err error) {
+	_, err = os.Stat(DriverVersionFile)
 	if err != nil {
-		return "", fmt.Errorf("amdgpu version file missing: %s %w", DriverVersionFile, err)
+		return 0, 0, fmt.Errorf("amdgpu version file missing: %s %w", DriverVersionFile, err)
 	}
 	fp, err := os.Open(DriverVersionFile)
 	if err != nil {
-		return "", err
+		return 0, 0, err
 	}
 	defer fp.Close()
 	verString, err := io.ReadAll(fp)
 	if err != nil {
-		return "", err
+		return 0, 0, err
 	}
-	return strings.TrimSpace(string(verString)), nil
+
+	pattern := `\A(\d+)\.(\d+).*`
+	regex := regexp.MustCompile(pattern)
+	match := regex.FindStringSubmatch(string(verString))
+	if len(match) < 2 {
+		return 0, 0, fmt.Errorf("malformed version string %s", string(verString))
+	}
+	driverMajor, err = strconv.Atoi(match[1])
+	if err != nil {
+		return 0, 0, err
+	}
+	driverMinor, err = strconv.Atoi(match[2])
+	if err != nil {
+		return 0, 0, err
+	}
+	return driverMajor, driverMinor, nil
+}
+
+func (gpus RocmGPUInfoList) RefreshFreeMemory() error {
+	if len(gpus) == 0 {
+		return nil
+	}
+	for i := range gpus {
+		usedMemory, err := getFreeMemory(gpus[i].usedFilepath)
+		if err != nil {
+			return err
+		}
+		slog.Debug("updating rocm free memory", "gpu", gpus[i].ID, "name", gpus[i].Name, "before", format.HumanBytes2(gpus[i].FreeMemory), "now", format.HumanBytes2(gpus[i].TotalMemory-usedMemory))
+		gpus[i].FreeMemory = gpus[i].TotalMemory - usedMemory
+	}
+	return nil
+}
+
+func getFreeMemory(usedFile string) (uint64, error) {
+	buf, err := os.ReadFile(usedFile)
+	if err != nil {
+		return 0, fmt.Errorf("failed to read sysfs node %s %w", usedFile, err)
+	}
+	usedMemory, err := strconv.ParseUint(strings.TrimSpace(string(buf)), 10, 64)
+	if err != nil {
+		slog.Debug("failed to parse sysfs node", "file", usedFile, "error", err)
+		return 0, fmt.Errorf("failed to parse sysfs node %s %w", usedFile, err)
+	}
+	return usedMemory, nil
+}
+
+func verifyKFDDriverAccess() error {
+	// Verify we have permissions - either running as root, or we have group access to the driver
+	fd, err := os.OpenFile("/dev/kfd", os.O_RDWR, 0o666)
+	if err != nil {
+		if errors.Is(err, fs.ErrPermission) {
+			return fmt.Errorf("permissions not set up properly.  Either run ollama as root, or add you user account to the render group. %w", err)
+		} else if errors.Is(err, fs.ErrNotExist) {
+			// Container runtime failure?
+			return fmt.Errorf("kfd driver not loaded.  If running in a container, remember to include '--device /dev/kfd --device /dev/dri'")
+		}
+		return fmt.Errorf("failed to check permission on /dev/kfd: %w", err)
+	}
+	fd.Close()
+	return nil
 }

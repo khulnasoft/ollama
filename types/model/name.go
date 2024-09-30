@@ -4,7 +4,6 @@ package model
 
 import (
 	"cmp"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -35,6 +34,12 @@ func Unqualified(n Name) error {
 // spot in logs.
 const MissingPart = "!MISSING!"
 
+const (
+	defaultHost      = "registry.ollama.ai"
+	defaultNamespace = "library"
+	defaultTag       = "latest"
+)
+
 // DefaultName returns a name with the default values for the host, namespace,
 // and tag parts. The model and digest parts are empty.
 //
@@ -43,9 +48,9 @@ const MissingPart = "!MISSING!"
 //   - The default tag is ("latest")
 func DefaultName() Name {
 	return Name{
-		Host:      "registry.ollama.ai",
-		Namespace: "library",
-		Tag:       "latest",
+		Host:      defaultHost,
+		Namespace: defaultNamespace,
+		Tag:       defaultTag,
 	}
 }
 
@@ -86,7 +91,6 @@ type Name struct {
 	Namespace string
 	Model     string
 	Tag       string
-	RawDigest string
 }
 
 // ParseName parses and assembles a Name from a name string. The
@@ -138,11 +142,6 @@ func ParseNameBare(s string) Name {
 	var n Name
 	var promised bool
 
-	s, n.RawDigest, promised = cutLast(s, "@")
-	if promised && n.RawDigest == "" {
-		n.RawDigest = MissingPart
-	}
-
 	// "/" is an illegal tag character, so we can use it to split the host
 	if strings.LastIndex(s, ":") > strings.LastIndex(s, "/") {
 		s, n.Tag, _ = cutPromised(s, ":")
@@ -161,10 +160,31 @@ func ParseNameBare(s string) Name {
 	}
 
 	scheme, host, ok := strings.Cut(s, "://")
-	if ! ok {
+	if !ok {
 		host = scheme
 	}
 	n.Host = host
+
+	return n
+}
+
+// ParseNameFromFilepath parses a 4-part filepath as a Name. The parts are
+// expected to be in the form:
+//
+// { host } "/" { namespace } "/" { model } "/" { tag }
+func ParseNameFromFilepath(s string) (n Name) {
+	parts := strings.Split(s, string(filepath.Separator))
+	if len(parts) != 4 {
+		return Name{}
+	}
+
+	n.Host = parts[0]
+	n.Namespace = parts[1]
+	n.Model = parts[2]
+	n.Tag = parts[3]
+	if !n.IsFullyQualified() {
+		return Name{}
+	}
 
 	return n
 }
@@ -196,26 +216,49 @@ func (n Name) String() string {
 		b.WriteByte(':')
 		b.WriteString(n.Tag)
 	}
-	if n.RawDigest != "" {
-		b.WriteByte('@')
-		b.WriteString(n.RawDigest)
-	}
 	return b.String()
+}
+
+// DisplayShortest returns a short string version of the name.
+func (n Name) DisplayShortest() string {
+	var sb strings.Builder
+
+	if n.Host != defaultHost {
+		sb.WriteString(n.Host)
+		sb.WriteByte('/')
+		sb.WriteString(n.Namespace)
+		sb.WriteByte('/')
+	} else if n.Namespace != defaultNamespace {
+		sb.WriteString(n.Namespace)
+		sb.WriteByte('/')
+	}
+
+	// always include model and tag
+	sb.WriteString(n.Model)
+	sb.WriteString(":")
+	sb.WriteString(n.Tag)
+	return sb.String()
+}
+
+// IsValidNamespace reports whether the provided string is a valid
+// namespace.
+func IsValidNamespace(s string) bool {
+	return isValidPart(kindNamespace, s)
 }
 
 // IsValid reports whether all parts of the name are present and valid. The
 // digest is a special case, and is checked for validity only if present.
+//
+// Note: The digest check has been removed as is planned to be added back in
+// at a later time.
 func (n Name) IsValid() bool {
-	if n.RawDigest != "" && !isValidPart(kindDigest, n.RawDigest) {
-		return false
-	}
 	return n.IsFullyQualified()
 }
 
 // IsFullyQualified returns true if all parts of the name are present and
 // valid without the digest.
 func (n Name) IsFullyQualified() bool {
-	var parts = []string{
+	parts := []string{
 		n.Host,
 		n.Namespace,
 		n.Model,
@@ -242,12 +285,12 @@ func (n Name) Filepath() string {
 	if !n.IsFullyQualified() {
 		panic("illegal attempt to get filepath of invalid name")
 	}
-	return strings.ToLower(filepath.Join(
+	return filepath.Join(
 		n.Host,
 		n.Namespace,
 		n.Model,
 		n.Tag,
-	))
+	)
 }
 
 // LogValue returns a slog.Value that represents the name as a string.
@@ -318,58 +361,4 @@ func cutPromised(s, sep string) (before, after string, ok bool) {
 		return before, after, false
 	}
 	return cmp.Or(before, MissingPart), cmp.Or(after, MissingPart), true
-}
-
-type DigestType byte
-
-const (
-	DigestTypeInvalid DigestType = iota
-	DigestTypeSHA256
-)
-
-func (t DigestType) String() string {
-	switch t {
-	case DigestTypeSHA256:
-		return "sha256"
-	default:
-		return "invalid"
-	}
-}
-
-type Digest struct {
-	Type DigestType
-	Sum  [32]byte
-}
-
-func ParseDigest(s string) (Digest, error) {
-	i := strings.IndexAny(s, "-:")
-	if i < 0 {
-		return Digest{}, fmt.Errorf("invalid digest %q", s)
-	}
-	typ, encSum := s[:i], s[i+1:]
-	if typ != "sha256" {
-		return Digest{}, fmt.Errorf("unsupported digest type %q", typ)
-	}
-	d := Digest{
-		Type: DigestTypeSHA256,
-	}
-	n, err := hex.Decode(d.Sum[:], []byte(encSum))
-	if err != nil {
-		return Digest{}, err
-	}
-	if n != 32 {
-		return Digest{}, fmt.Errorf("digest %q decoded to %d bytes; want 32", encSum, n)
-	}
-	return d, nil
-}
-
-func (d Digest) String() string {
-	if d.Type == DigestTypeInvalid {
-		return ""
-	}
-	return fmt.Sprintf("sha256-%x", d.Sum)
-}
-
-func (d Digest) IsValid() bool {
-	return d.Type != DigestTypeInvalid
 }

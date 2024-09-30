@@ -1,17 +1,19 @@
 package llm
 
-// #cgo CFLAGS: -Illama.cpp
-// #cgo darwin,arm64 LDFLAGS: ${SRCDIR}/build/darwin/arm64_static/libllama.a -lstdc++
-// #cgo darwin,amd64 LDFLAGS: ${SRCDIR}/build/darwin/x86_64_static/libllama.a -lstdc++
-// #cgo windows,amd64 LDFLAGS: ${SRCDIR}/build/windows/amd64_static/libllama.a -static -lstdc++
-// #cgo windows,arm64 LDFLAGS: ${SRCDIR}/build/windows/arm64_static/libllama.a -static -lstdc++
-// #cgo linux,amd64 LDFLAGS: ${SRCDIR}/build/linux/x86_64_static/libllama.a -lstdc++
-// #cgo linux,arm64 LDFLAGS: ${SRCDIR}/build/linux/arm64_static/libllama.a -lstdc++
+// #cgo CFLAGS: -Illama.cpp -Illama.cpp/include -Illama.cpp/ggml/include
+// #cgo LDFLAGS: -lllama -lggml -lstdc++ -lpthread
+// #cgo darwin,arm64 LDFLAGS: -L${SRCDIR}/build/darwin/arm64_static -L${SRCDIR}/build/darwin/arm64_static/src -L${SRCDIR}/build/darwin/arm64_static/ggml/src -framework Accelerate -framework Metal
+// #cgo darwin,amd64 LDFLAGS: -L${SRCDIR}/build/darwin/x86_64_static -L${SRCDIR}/build/darwin/x86_64_static/src -L${SRCDIR}/build/darwin/x86_64_static/ggml/src
+// #cgo windows,amd64 LDFLAGS: -static-libstdc++ -static-libgcc -static -L${SRCDIR}/build/windows/amd64_static -L${SRCDIR}/build/windows/amd64_static/src -L${SRCDIR}/build/windows/amd64_static/ggml/src
+// #cgo windows,arm64 LDFLAGS: -lllama -lggml -static-libstdc++ -static-libgcc -static -L${SRCDIR}/build/windows/arm64_static -L${SRCDIR}/build/windows/arm64_static/src -L${SRCDIR}/build/windows/arm64_static/ggml/src
+// #cgo linux,amd64 LDFLAGS: -L${SRCDIR}/build/linux/x86_64_static -L${SRCDIR}/build/linux/x86_64_static/src -L${SRCDIR}/build/linux/x86_64_static/ggml/src
+// #cgo linux,arm64 LDFLAGS: -L${SRCDIR}/build/linux/arm64_static -L${SRCDIR}/build/linux/arm64_static/src -L${SRCDIR}/build/linux/arm64_static/ggml/src
 // #include <stdlib.h>
 // #include "llama.h"
 import "C"
+
 import (
-	"fmt"
+	"errors"
 	"unsafe"
 )
 
@@ -20,7 +22,7 @@ func SystemInfo() string {
 	return C.GoString(C.llama_print_system_info())
 }
 
-func Quantize(infile, outfile, filetype string) error {
+func Quantize(infile, outfile string, ftype fileType) error {
 	cinfile := C.CString(infile)
 	defer C.free(unsafe.Pointer(cinfile))
 
@@ -29,58 +31,10 @@ func Quantize(infile, outfile, filetype string) error {
 
 	params := C.llama_model_quantize_default_params()
 	params.nthread = -1
+	params.ftype = ftype.Value()
 
-	switch filetype {
-	case "F32":
-		params.ftype = fileTypeF32
-	case "F16":
-		params.ftype = fileTypeF16
-	case "Q4_0":
-		params.ftype = fileTypeQ4_0
-	case "Q4_1":
-		params.ftype = fileTypeQ4_1
-	case "Q4_1_F16":
-		params.ftype = fileTypeQ4_1_F16
-	case "Q8_0":
-		params.ftype = fileTypeQ8_0
-	case "Q5_0":
-		params.ftype = fileTypeQ5_0
-	case "Q5_1":
-		params.ftype = fileTypeQ5_1
-	case "Q2_K":
-		params.ftype = fileTypeQ2_K
-	case "Q3_K_S":
-		params.ftype = fileTypeQ3_K_S
-	case "Q3_K_M":
-		params.ftype = fileTypeQ3_K_M
-	case "Q3_K_L":
-		params.ftype = fileTypeQ3_K_L
-	case "Q4_K_S":
-		params.ftype = fileTypeQ4_K_S
-	case "Q4_K_M":
-		params.ftype = fileTypeQ4_K_M
-	case "Q5_K_S":
-		params.ftype = fileTypeQ5_K_S
-	case "Q5_K_M":
-		params.ftype = fileTypeQ5_K_M
-	case "Q6_K":
-		params.ftype = fileTypeQ6_K
-	case "IQ2_XXS":
-		params.ftype = fileTypeIQ2_XXS
-	case "IQ2_XS":
-		params.ftype = fileTypeIQ2_XS
-	case "Q2_K_S":
-		params.ftype = fileTypeQ2_K_S
-	case "Q3_K_XS":
-		params.ftype = fileTypeQ3_K_XS
-	case "IQ3_XXS":
-		params.ftype = fileTypeIQ3_XXS
-	default:
-		return fmt.Errorf("unknown filetype: %s", filetype)
-	}
-
-	if retval := C.llama_model_quantize(cinfile, coutfile, &params); retval != 0 {
-		return fmt.Errorf("llama_model_quantize: %d", retval)
+	if rc := C.llama_model_quantize(cinfile, coutfile, &params); rc != 0 {
+		return errors.New("failed to quantize model. This model architecture may not be supported, or you may need to upgrade Ollama to the latest version")
 	}
 
 	return nil

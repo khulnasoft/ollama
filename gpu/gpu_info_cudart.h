@@ -6,9 +6,9 @@
 // Just enough typedef's to dlopen/dlsym for memory information
 typedef enum cudartReturn_enum {
   CUDART_SUCCESS = 0,
-  CUDA_ERROR_INVALID_VALUE = 1,
-  CUDA_ERROR_MEMORY_ALLOCATION = 2,
-  CUDA_ERROR_INSUFFICIENT_DRIVER = 35,
+  CUDART_ERROR_INVALID_VALUE = 1,
+  CUDART_ERROR_MEMORY_ALLOCATION = 2,
+  CUDART_ERROR_INSUFFICIENT_DRIVER = 35,
   // Other values omitted for now...
 } cudartReturn_t;
 
@@ -140,7 +140,8 @@ typedef struct cudart_init_resp {
 } cudart_init_resp_t;
 
 void cudart_init(char *cudart_lib_path, cudart_init_resp_t *resp);
-void cudart_check_vram(cudart_handle_t ch, int device_id, mem_info_t *resp);
+void cudart_bootstrap(cudart_handle_t ch, int device_id, mem_info_t *resp);
+// TODO - if we keep this library longer term, add cudart_get_free
 void cudart_release(cudart_handle_t ch);
 
 #endif  // __GPU_INFO_CUDART_H__
